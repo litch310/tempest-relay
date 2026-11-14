@@ -1,0 +1,9 @@
+# Render blueprint: New > Blueprint, pick this repository.
+services:
+  - type: web
+    name: tempest-relay
+    runtime: node
+    plan: free
+    buildCommand: "true"
+    startCommand: node relay.js
+    healthCheckPath: /
