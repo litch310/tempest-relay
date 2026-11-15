@@ -7,3 +7,9 @@ services:
     buildCommand: "true"
     startCommand: node relay.js
     healthCheckPath: /
+    envVars:
+      # Render runs behind a proxy, so the real player IP is in X-Forwarded-For.
+      # Without this, the per-IP abuse limits would see only Render's proxy address
+      # and treat every player as one client.
+      - key: TRUST_PROXY
+        value: "1"
