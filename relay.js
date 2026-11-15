@@ -41,6 +41,7 @@ const MAX_CONNS_PER_IP = num('MAX_CONNS_PER_IP', 24);  // sockets from one addre
 const MAX_ROOMS        = num('MAX_ROOMS', 2000);        // total open rooms
 const MAX_ROOMS_PER_IP = num('MAX_ROOMS_PER_IP', 20);  // rooms hosted from one address
 const JOIN_GRACE_MS    = num('JOIN_GRACE_MS', 30000);  // drop a socket that never joins a room
+const PING_MS          = num('PING_MS', 5000);         // ping every 5 s; no answer by the next ping = gone
 const CTRL_RATE        = num('CTRL_RATE', 15);         // control msgs/s (create/join/lock/kick/leave)
 const CTRL_BURST       = num('CTRL_BURST', 30);
 const DATA_BYTES_PER_S = num('DATA_BYTES_PER_S', 8 << 20);   // game-data byte budget, 8 MiB/s
@@ -96,6 +97,7 @@ class Conn {
   }
 
   onData(d) {
+    this.alive = true;                     // anything from the player proves the connection is alive
     this.buf = this.buf.length ? Buffer.concat([this.buf, d]) : d;
     for (;;) {
       if (this.buf.length < 2) return;
@@ -324,7 +326,9 @@ server.on('upgrade', (req, sock) => {
   conns.add(c);
 });
 
-// drop connections that stop answering pings (phones that lost signal)
+// drop connections that go silent (a host whose game crashed, a phone that lost signal). Hosting
+// proxies like Render's don't pass a dropped connection on to the relay, so this check is how the
+// other players in the room find out: within PING_MS to 2 x PING_MS (5-10 s by default).
 setInterval(() => {
   for (const c of conns) {
     try {
@@ -333,7 +337,7 @@ setInterval(() => {
       c.send(0x9, Buffer.alloc(0));
     } catch (e) { try { c.onClose(); } catch (e2) { /* gone */ } }
   }
-}, 15000).unref();
+}, PING_MS).unref();
 
 // ---------------------------------------------------------------- stay up (don't let the relay "go down")
 // 1) One unhandled error must never take the whole server (and every room on it) down. Log and keep serving.

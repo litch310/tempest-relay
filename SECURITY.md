@@ -54,13 +54,17 @@ so legit play never trips them. Lower them only if you see abuse; raise them for
   min (`RENDER_EXTERNAL_URL`, set by Render automatically, or `KEEPALIVE_URL`) to stay awake.
 - **Clean restarts.** On `SIGTERM`/`SIGINT` (a deploy or instance recycle) the relay sends every client
   a 1012 "service restart" close frame instead of dropping them cold.
-- **WebSocket keepalive.** Dead sockets (a phone that lost signal) are pinged every 15 s and dropped if
-  they stop answering, so rooms don't fill with ghosts.
+- **Fast dead-player detection.** Every socket is pinged every 5 s (`PING_MS`); one that sends nothing
+  (no game data, no ping reply) until the next ping is dropped, so the rest of the room hears within
+  5–10 s when a host crashes or a phone loses signal. This matters on Render, whose proxy doesn't pass a
+  dropped connection on to the relay. Any message from a player counts as a sign of life, so busy
+  players are never dropped.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `KEEPALIVE_URL` | `RENDER_EXTERNAL_URL` | public URL the relay pings to stay awake (empty = off) |
 | `KEEPALIVE_MS` | 600000 | how often to self-ping (10 min) |
+| `PING_MS` | 5000 | how often to ping players; silent for one interval = dropped (5–10 s) |
 
 ## Still on you (not something code can do for you)
 
