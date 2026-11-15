@@ -59,12 +59,18 @@ so legit play never trips them. Lower them only if you see abuse; raise them for
   5–10 s when a host crashes or a phone loses signal. This matters on Render, whose proxy doesn't pass a
   dropped connection on to the relay. Any message from a player counts as a sign of life, so busy
   players are never dropped.
+- **Heartbeats, for frozen or vanished games behind a proxy.** Render's proxy answers the relay's pings
+  itself, so the ping check alone can't tell that a host's game froze or its phone lost signal. The game
+  sends a tiny `{"t":"hb"}` every 2 s once it is in a room; a game that has sent heartbeats and then goes
+  quiet (no heartbeat, no game data) for `HB_TIMEOUT_MS` is dropped, so the rest of the room hears within
+  ~10-15 s. Games that never send heartbeats (older builds) keep only the ping check, as before.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `KEEPALIVE_URL` | `RENDER_EXTERNAL_URL` | public URL the relay pings to stay awake (empty = off) |
 | `KEEPALIVE_MS` | 600000 | how often to self-ping (10 min) |
 | `PING_MS` | 5000 | how often to ping players; silent for one interval = dropped (5–10 s) |
+| `HB_TIMEOUT_MS` | 10000 | drop a heartbeat-sending game that goes quiet this long (checked every `PING_MS`) |
 
 ## Still on you (not something code can do for you)
 

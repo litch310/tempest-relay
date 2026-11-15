@@ -42,6 +42,7 @@ const MAX_ROOMS        = num('MAX_ROOMS', 2000);        // total open rooms
 const MAX_ROOMS_PER_IP = num('MAX_ROOMS_PER_IP', 20);  // rooms hosted from one address
 const JOIN_GRACE_MS    = num('JOIN_GRACE_MS', 30000);  // drop a socket that never joins a room
 const PING_MS          = num('PING_MS', 5000);         // ping every 5 s; no answer by the next ping = gone
+const HB_TIMEOUT_MS    = num('HB_TIMEOUT_MS', 10000);  // a game that sends heartbeats and then goes quiet this long = gone
 const CTRL_RATE        = num('CTRL_RATE', 15);         // control msgs/s (create/join/lock/kick/leave)
 const CTRL_BURST       = num('CTRL_BURST', 30);
 const DATA_BYTES_PER_S = num('DATA_BYTES_PER_S', 8 << 20);   // game-data byte budget, 8 MiB/s
@@ -85,6 +86,8 @@ class Conn {
     this.id = 0;
     this.name = '';
     this.alive = true;
+    this.hb = false;                       // true once this game sends heartbeats (newer builds)
+    this.lastApp = Date.now();             // last game message (heartbeat, control or data)
     this.closed = false;
     this.ctrlB = bucket(CTRL_RATE, CTRL_BURST);
     this.dataB = bucket(DATA_BYTES_PER_S, DATA_BURST);
@@ -177,6 +180,7 @@ class Conn {
   }
 
   onMessage(op, data) {
+    this.lastApp = Date.now();
     if (op === 0x2) {
       if (!take(this.dataB, Math.max(1, data.length))) return this.kill(1009);   // byte-rate flood
       return relayData(this, data);
@@ -184,6 +188,7 @@ class Conn {
     if (!take(this.ctrlB, 1)) return this.kill(1008);      // control flood
     let m;
     try { m = JSON.parse(data.toString('utf8')); } catch (e) { return this.json({ t: 'error', why: 'bad message' }); }
+    if (m && m.t === 'hb') { this.hb = true; return; }     // heartbeat: "I'm still here", no reply
     control(this, m);
   }
 }
@@ -333,6 +338,10 @@ setInterval(() => {
   for (const c of conns) {
     try {
       if (!c.alive) { c.kill(1001); continue; }
+      // the proxy in front of a hosted relay (Render) answers pings itself, so a frozen or vanished
+      // game still looks alive at the socket level. Games that send heartbeats are dropped when those
+      // stop; older games that never sent one keep the plain ping check above.
+      if (c.hb && Date.now() - c.lastApp > HB_TIMEOUT_MS) { c.kill(1001); continue; }
       c.alive = false;
       c.send(0x9, Buffer.alloc(0));
     } catch (e) { try { c.onClose(); } catch (e2) { /* gone */ } }
