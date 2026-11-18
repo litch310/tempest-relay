@@ -12,13 +12,22 @@
 //                      {"t":"lock"}      host only: the game started, nobody else may join
 //                      {"t":"kick","id":3}  host only
 //                      {"t":"leave"}
-//     relay -> client  {"t":"created","code":"KX4PT","id":1}
-//                      {"t":"joined","code":"KX4PT","id":2,"host":1,"peers":[{"id":1,"name":"Ann"}, ...]}
+//                      {"t":"hb"} / {"t":"hb","busy":60}   heartbeat; busy = "I may be unresponsive up to 60 s"
+//                      {"t":"rejoin","code":"KX4PT","id":2,"token":"..","name":"Bo","ver":"2"}   (v2) back
+//                                        into your seat after a dropped connection
+//     relay -> client  {"t":"created","code":"KX4PT","id":1,"token":".."}
+//                      {"t":"joined","code":"KX4PT","id":2,"host":1,"token":"..","peers":[{"id":1,"name":"Ann"}, ...]}
+//                      {"t":"rejoined", same fields as joined, "away":[ids]}
 //                      {"t":"peer_in","id":2,"name":"Bo"}   {"t":"peer_out","id":2}
+//                      {"t":"peer_away","id":2}  {"t":"peer_back","id":2,"name":"Bo"}   (v2) lost / back
 //                      {"t":"closed","why":"..."}           the host left: the room is gone
 //                      {"t":"error","why":"..."}
+//   v2 rooms: a player whose connection drops (without "leave") keeps their seat for REJOIN_MS, the
+//   host's too. If the relay itself restarted, the host's rejoin re-opens its room under the same code.
 //   binary frames: game data. client -> relay: [to (1 byte, 0 = everyone else)] + payload
 //                                relay -> client: [from (1 byte)] + payload
+//     v2 payloads start with a flags byte; bit value 2 = droppable (a full-state snapshot: to a player
+//     whose connection is falling behind the relay skips it, the next one replaces it anyway)
 //
 // Abuse limits (all overridable by env; defaults sit far above a real 4-player match so legit
 // games never trip them). A real host sends ~15 snapshots/s per peer (~45 frames/s, a few MiB/s
@@ -30,7 +39,7 @@ const crypto = require('crypto');
 const num = (name, def) => { const v = parseInt(process.env[name] || '', 10); return Number.isFinite(v) && v >= 0 ? v : def; };
 
 const PORT = num('PORT', 8787);
-const VERSION = '1';
+const VERSIONS = new Set(['1', '2']);  // a room only takes players of its creator's version
 const MAX_PLAYERS = 4;
 const MAX_FRAME = 1 << 20;            // 1 MiB per message
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no 0/O, 1/I
@@ -42,12 +51,15 @@ const MAX_ROOMS        = num('MAX_ROOMS', 2000);        // total open rooms
 const MAX_ROOMS_PER_IP = num('MAX_ROOMS_PER_IP', 20);  // rooms hosted from one address
 const JOIN_GRACE_MS    = num('JOIN_GRACE_MS', 30000);  // drop a socket that never joins a room
 const PING_MS          = num('PING_MS', 5000);         // ping every 5 s; no answer by the next ping = gone
-const HB_TIMEOUT_MS    = num('HB_TIMEOUT_MS', 10000);  // a game that sends heartbeats and then goes quiet this long = gone
+const HB_TIMEOUT_MS    = num('HB_TIMEOUT_MS', 20000);  // a game that sends heartbeats and then goes quiet this long = gone
+const BUSY_MAX_S       = num('BUSY_MAX_S', 150);       // longest "busy" honoured (loading a map, app in the background)
+const REJOIN_MS        = num('REJOIN_MS', 75000);      // a dropped v2 player's seat is kept this long
+const LAG_SKIP_BYTES   = num('LAG_SKIP_BYTES', 384 << 10);   // skip droppable frames to a reader this far behind
 const CTRL_RATE        = num('CTRL_RATE', 15);         // control msgs/s (create/join/lock/kick/leave)
 const CTRL_BURST       = num('CTRL_BURST', 30);
 const DATA_BYTES_PER_S = num('DATA_BYTES_PER_S', 8 << 20);   // game-data byte budget, 8 MiB/s
 const DATA_BURST       = num('DATA_BURST', 4 << 20);         // 4 MiB bucket
-const SEND_BUF_MAX     = num('SEND_BUF_MAX', 8 << 20);  // kill a client whose outbox backs up past this
+const SEND_BUF_MAX     = num('SEND_BUF_MAX', 16 << 20);  // kill a client whose outbox backs up past this
 const MAX_FRAGMENTS    = num('MAX_FRAGMENTS', 256);     // continuation frames per message
 const HANDSHAKE_MS     = num('HANDSHAKE_MS', 10000);    // time allowed to complete the HTTP upgrade
 const TRUST_PROXY      = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');   // read X-Forwarded-For
@@ -88,6 +100,8 @@ class Conn {
     this.alive = true;
     this.hb = false;                       // true once this game sends heartbeats (newer builds)
     this.lastApp = Date.now();             // last game message (heartbeat, control or data)
+    this.busyUntil = 0;                    // it said it may be unresponsive until then
+    this.token = crypto.randomBytes(9).toString('base64url');   // proof for a later rejoin
     this.closed = false;
     this.ctrlB = bucket(CTRL_RATE, CTRL_BURST);
     this.dataB = bucket(DATA_BYTES_PER_S, DATA_BURST);
@@ -173,7 +187,7 @@ class Conn {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.grace);
-    leaveRoom(this);
+    goAway(this);
     conns.delete(this);
     const s = perIp.get(this.ip);
     if (s) { s.conns--; ipDrop(this.ip); }
@@ -188,7 +202,11 @@ class Conn {
     if (!take(this.ctrlB, 1)) return this.kill(1008);      // control flood
     let m;
     try { m = JSON.parse(data.toString('utf8')); } catch (e) { return this.json({ t: 'error', why: 'bad message' }); }
-    if (m && m.t === 'hb') { this.hb = true; return; }     // heartbeat: "I'm still here", no reply
+    if (m && m.t === 'hb') {                               // heartbeat: "I'm still here", no reply
+      this.hb = true;
+      if (m.busy !== undefined) this.busyUntil = Date.now() + Math.min(BUSY_MAX_S, Math.max(0, Number(m.busy) || 0)) * 1000;
+      return;
+    }
     control(this, m);
   }
 }
@@ -212,43 +230,52 @@ function control(c, m) {
   switch (m.t) {
     case 'create': {
       if (c.room) return c.json({ t: 'error', why: 'already in a room' });
-      if (String(m.ver) !== VERSION) return c.json({ t: 'error', why: 'version' });
+      if (!VERSIONS.has(String(m.ver))) return c.json({ t: 'error', why: 'version' });
       if (rooms.size >= MAX_ROOMS) return c.json({ t: 'error', why: 'the server is full' });
       const st = ipStat(c.ip);
       if (st.rooms >= MAX_ROOMS_PER_IP) return c.json({ t: 'error', why: 'too many rooms' });
-      const room = { code: newCode(), host: 1, peers: new Map(), locked: false, next: 2, ip: c.ip,
-        max: Math.max(2, Math.min(MAX_PLAYERS, parseInt(m.max || MAX_PLAYERS, 10) || MAX_PLAYERS)) };
+      const room = { code: newCode(), host: 1, peers: new Map(), away: new Map(), locked: false, next: 2, ip: c.ip,
+        ver: String(m.ver), max: Math.max(2, Math.min(MAX_PLAYERS, parseInt(m.max || MAX_PLAYERS, 10) || MAX_PLAYERS)) };
       rooms.set(room.code, room);
       st.rooms++;
       c.room = room; c.id = 1; c.name = cleanName(m.name);
       room.peers.set(1, c);
       log('room', room.code, 'created by', c.name);
-      return c.json({ t: 'created', code: room.code, id: 1 });
+      return c.json({ t: 'created', code: room.code, id: 1, token: c.token });
     }
     case 'join': {
       if (c.room) return c.json({ t: 'error', why: 'already in a room' });
-      if (String(m.ver) !== VERSION) return c.json({ t: 'error', why: 'version' });
+      if (!VERSIONS.has(String(m.ver))) return c.json({ t: 'error', why: 'version' });
       const room = rooms.get(String(m.code || '').toUpperCase().trim());
       if (!room) return c.json({ t: 'error', why: 'no such room' });
+      if (String(m.ver) !== room.ver) return c.json({ t: 'error', why: 'version' });
       if (room.locked) return c.json({ t: 'error', why: 'the game already started' });
-      if (room.peers.size >= room.max) return c.json({ t: 'error', why: 'the room is full' });
+      if (room.peers.size + room.away.size >= room.max) return c.json({ t: 'error', why: 'the room is full' });
       let id = room.next;
-      while (room.peers.has(id) || id > 250) id = id > 250 ? 2 : id + 1;
+      while (room.peers.has(id) || room.away.has(id) || id > 250) id = id > 250 ? 2 : id + 1;
       room.next = id + 1;
       c.room = room; c.id = id; c.name = cleanName(m.name);
-      const peers = [...room.peers.values()].map((p) => ({ id: p.id, name: p.name }));
+      const peers = listPeers(room);
       for (const p of room.peers.values()) p.json({ t: 'peer_in', id, name: c.name });
       room.peers.set(id, c);
       log('room', room.code, c.name, 'joined as', id);
-      return c.json({ t: 'joined', code: room.code, id, host: room.host, peers });
+      return c.json({ t: 'joined', code: room.code, id, host: room.host, peers, token: c.token, away: [...room.away.keys()] });
     }
+    case 'rejoin':
+      return rejoin(c, m);
     case 'lock':
       if (c.room && c.id === c.room.host) c.room.locked = true;
       return;
     case 'kick': {
       if (!c.room || c.id !== c.room.host) return;
-      const p = c.room.peers.get(parseInt(m.id, 10));
+      const kid = parseInt(m.id, 10);
+      const p = c.room.peers.get(kid);
       if (p && p !== c) { p.json({ t: 'closed', why: 'removed by the host' }); leaveRoom(p); p.room = null; }
+      else if (kid !== c.id && c.room.away.has(kid)) {     // give up on a dropped player now
+        clearTimeout(c.room.away.get(kid).timer);
+        c.room.away.delete(kid);
+        for (const q of c.room.peers.values()) q.json({ t: 'peer_out', id: kid });
+      }
       return;
     }
     case 'leave':
@@ -261,22 +288,112 @@ function control(c, m) {
   }
 }
 
+// everyone in the room: connected players and the seats kept for dropped ones
+function listPeers(room) {
+  const out = [...room.peers.values()].map((p) => ({ id: p.id, name: p.name }));
+  for (const [id, a] of room.away) out.push({ id, name: a.name });
+  return out;
+}
+
+function closeRoom(room, why) {
+  for (const p of room.peers.values()) { p.json({ t: 'closed', why }); p.room = null; }
+  room.peers.clear();
+  for (const a of room.away.values()) clearTimeout(a.timer);
+  room.away.clear();
+  if (rooms.get(room.code) !== room) return;
+  rooms.delete(room.code);
+  const st = perIp.get(room.ip);
+  if (st) { st.rooms--; ipDrop(room.ip); }
+  log('room', room.code, 'closed:', why);
+}
+
+// a player left on purpose (or was kicked): gone for good
 function leaveRoom(c) {
   const room = c.room;
-  if (!room || !room.peers.has(c.id) || room.peers.get(c.id) !== c) return;
+  if (!room || room.peers.get(c.id) !== c) return;
   room.peers.delete(c.id);
   if (c.id === room.host) {
-    // no host, no game: everyone else is told and the room goes
-    for (const p of room.peers.values()) { p.json({ t: 'closed', why: 'the host left' }); p.room = null; }
-    room.peers.clear();
-    rooms.delete(room.code);
-    const st = perIp.get(room.ip);
-    if (st) { st.rooms--; ipDrop(room.ip); }
-    log('room', room.code, 'closed');
+    closeRoom(room, 'the host left');       // no host, no game
   } else {
     for (const p of room.peers.values()) p.json({ t: 'peer_out', id: c.id });
     log('room', room.code, c.name, 'left');
+    if (room.peers.size === 0 && room.away.size === 0) closeRoom(room, 'empty');
   }
+}
+
+// a connection dropped without saying goodbye: in a v2 room the player keeps their seat for a while
+function goAway(c) {
+  const room = c.room;
+  if (!room || room.peers.get(c.id) !== c) return;
+  if (room.ver !== '2') return leaveRoom(c);
+  room.peers.delete(c.id);
+  const id = c.id;
+  room.away.set(id, { name: c.name, token: c.token, timer: setTimeout(() => expire(room, id), REJOIN_MS) });
+  for (const p of room.peers.values()) p.json({ t: 'peer_away', id });
+  log('room', room.code, c.name, 'dropped, seat kept');
+}
+
+function expire(room, id) {
+  if (!room.away.has(id)) return;
+  room.away.delete(id);
+  if (id === room.host) return closeRoom(room, 'the host lost connection');
+  for (const p of room.peers.values()) p.json({ t: 'peer_out', id });
+  log('room', room.code, 'seat', id, 'given up');
+  if (room.peers.size === 0 && room.away.size === 0) closeRoom(room, 'empty');
+}
+
+function rejoin(c, m) {
+  if (c.room) return c.json({ t: 'error', why: 'already in a room' });
+  if (String(m.ver) !== '2') return c.json({ t: 'error', why: 'version' });
+  const code = String(m.code || '').toUpperCase().trim();
+  const id = parseInt(m.id, 10);
+  const token = String(m.token || '');
+  if (!/^[A-Z0-9]{5}$/.test(code) || !(id >= 1 && id <= 250) || token.length < 8 || token.length > 64) {
+    return c.json({ t: 'error', why: 'bad rejoin' });
+  }
+  let room = rooms.get(code);
+  if (!room) {
+    // the relay restarted and lost its rooms: the host re-opens its room under the same code, keeping
+    // seats for the players it lists (their tokens went with the restart: the seat's id is the claim)
+    if (id !== 1 || rooms.size >= MAX_ROOMS) return c.json({ t: 'error', why: 'no such room' });
+    const st = ipStat(c.ip);
+    if (st.rooms >= MAX_ROOMS_PER_IP) return c.json({ t: 'error', why: 'too many rooms' });
+    room = { code, host: 1, peers: new Map(), away: new Map(), locked: !!m.locked, next: 2, ip: c.ip, ver: '2',
+      max: MAX_PLAYERS };
+    rooms.set(code, room);
+    st.rooms++;
+    for (const p of (Array.isArray(m.peers) ? m.peers : []).slice(0, MAX_PLAYERS)) {
+      const pid = parseInt(p && p.id, 10);
+      if (!(pid >= 2 && pid <= 250) || room.away.has(pid)) continue;
+      const r = room;
+      room.away.set(pid, { name: cleanName(p.name), token: '', timer: setTimeout(() => expire(r, pid), REJOIN_MS) });
+      room.next = Math.max(room.next, pid + 1);
+    }
+    room.away.set(1, { name: cleanName(m.name), token, timer: null });
+    log('room', code, 're-opened by its host after a relay restart');
+  }
+  const cur = room.peers.get(id);
+  if (cur) {
+    // its old connection isn't noticed as dead yet: the same player (same token) takes over
+    if (cur.token !== token) return c.json({ t: 'error', why: 'seat gone' });
+    room.peers.delete(id);
+    cur.room = null;
+    cur.kill(4000);
+  } else {
+    const a = room.away.get(id);
+    if (!a) return c.json({ t: 'error', why: 'seat gone' });
+    if (a.token && a.token !== token) return c.json({ t: 'error', why: 'seat gone' });
+    clearTimeout(a.timer);
+    room.away.delete(id);
+  }
+  c.room = room; c.id = id; c.name = cleanName(m.name); c.token = token;
+  clearTimeout(c.grace);
+  const peers = listPeers(room);
+  for (const p of room.peers.values()) p.json({ t: 'peer_back', id, name: c.name });
+  room.peers.set(id, c);
+  log('room', room.code, c.name, 'rejoined as', id);
+  return c.json({ t: 'rejoined', code: room.code, id, host: room.host, token, peers, away: [...room.away.keys()],
+    locked: room.locked });
 }
 
 function relayData(c, data) {
@@ -285,11 +402,18 @@ function relayData(c, data) {
   const to = data[0];
   const out = Buffer.from(data);
   out[0] = c.id;                         // the receiver sees who sent it
+  const droppable = room.ver === '2' && data.length > 1 && (data[1] & 2) !== 0;
+  const give = (p) => {
+    // a full-state snapshot to a player whose connection is falling behind: skip it rather than
+    // queue seconds of stale ones (or drop the player); the next one brings them up to date
+    if (droppable && p.sock.writableLength > LAG_SKIP_BYTES) return;
+    p.send(0x2, out);
+  };
   if (to === 0) {
-    for (const p of room.peers.values()) if (p !== c) p.send(0x2, out);
+    for (const p of room.peers.values()) if (p !== c) give(p);
   } else {
     const p = room.peers.get(to);
-    if (p) p.send(0x2, out);
+    if (p) give(p);
   }
 }
 
@@ -337,11 +461,12 @@ server.on('upgrade', (req, sock) => {
 setInterval(() => {
   for (const c of conns) {
     try {
-      if (!c.alive) { c.kill(1001); continue; }
+      const busy = Date.now() < c.busyUntil;   // loading a map / in the background: it said so
+      if (!c.alive && !busy) { c.kill(1001); continue; }
       // the proxy in front of a hosted relay (Render) answers pings itself, so a frozen or vanished
       // game still looks alive at the socket level. Games that send heartbeats are dropped when those
       // stop; older games that never sent one keep the plain ping check above.
-      if (c.hb && Date.now() - c.lastApp > HB_TIMEOUT_MS) { c.kill(1001); continue; }
+      if (c.hb && !busy && Date.now() - c.lastApp > HB_TIMEOUT_MS) { c.kill(1001); continue; }
       c.alive = false;
       c.send(0x9, Buffer.alloc(0));
     } catch (e) { try { c.onClose(); } catch (e2) { /* gone */ } }

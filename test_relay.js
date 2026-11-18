@@ -64,6 +64,32 @@ const ok = (cond, what) => { console.log((cond ? 'OK   ' : 'FAIL ') + what); if 
   f.send({ t: 'join', code: 'XXXXX', name: 'v', ver: '0' });
   await wait(100);
   ok(f.last('error')?.why === 'version', 'old game version refused');
+  // version 2: a dropped player keeps their seat and gets back in with their token
+  const h = client('Hal'), g = client('Gil');
+  await Promise.all([h.open, g.open]);
+  h.send({ t: 'create', name: 'Hal', max: 2, ver: '2' });
+  await wait(100);
+  const code2 = h.last('created')?.code;
+  ok(!!h.last('created')?.token, 'v2 create gives a rejoin token');
+  g.send({ t: 'join', code: code2, name: 'Gil', ver: '2' });
+  await wait(100);
+  const tok = g.last('joined')?.token;
+  g.ws.close();                                   // the connection drops (no "leave")
+  await wait(200);
+  ok(h.last('peer_away')?.id === 2, 'host told the player lost connection (seat kept)');
+  const g2 = client('Gil');
+  await g2.open;
+  g2.send({ t: 'rejoin', code: code2, id: 2, token: 'wrong-token-123', name: 'Gil', ver: '2' });
+  await wait(100);
+  ok(g2.last('error')?.why === 'seat gone', 'a wrong token is refused');
+  g2.send({ t: 'rejoin', code: code2, id: 2, token: tok, name: 'Gil', ver: '2' });
+  await wait(100);
+  ok(g2.last('rejoined')?.id === 2, 'back in the same seat');
+  ok(h.last('peer_back')?.id === 2, 'host told the player is back');
+  h.ws.send(new Uint8Array([0, 2, 7, 7]));        // a droppable frame still reaches a reader that keeps up
+  await wait(100);
+  ok(g2.data.length === 1 && g2.data[0][0] === 1, 'droppable frame delivered');
+  for (const x of [h, g2]) x.ws.close();
   for (const x of [a, b, c, d, f]) x.ws.close();
   server.close();
   console.log(fails ? `${fails} FAILED` : 'ALL OK');
